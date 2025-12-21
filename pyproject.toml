@@ -1,0 +1,25 @@
+﻿[build-system]
+requires = ["setuptools>=67", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clearing-simulation"
+version = "0.1.0"
+description = "Toy clearing simulation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+  "numpy",
+  "pandas",
+  "kagglehub",
+  "dimod",
+  "dwave-ocean-sdk",
+  "boltzmann @ git+https://github.com/Joxy97/BoltzmaNN9.git",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
