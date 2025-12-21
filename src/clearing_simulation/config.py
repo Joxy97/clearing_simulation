@@ -4,6 +4,8 @@ import copy
 import json
 from typing import Any, Dict, Optional
 
+REPLACE_KEYS = {"clearing_members", "ccps"}
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "seed": None,
     "model": {
@@ -54,6 +56,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
 def _deep_update(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
     for key, val in updates.items():
+        if key in REPLACE_KEYS:
+            base[key] = val
+            continue
         if isinstance(val, dict) and isinstance(base.get(key), dict):
             base[key] = _deep_update(base[key], val)
         else:
