@@ -30,12 +30,16 @@
     "cm_absorbs_shortfall": true
   },
   "clearing_members": {
-    "CM": {"n_clients": 100, "cm_funds": 100000.0}
+    "CM": {"n_clients": 10, "cm_funds": 100000.0}
   },
   "ccps": {
     "CCP": {"instrument_indices": "all", "default_fund": 10000000.0}
   },
   "output": {
-    "path": "outputs/metrics.json"
+    "path": "outputs/metrics.json",
+    "include_details": true,
+    "include_portfolios": true,
+    "include_scenarios": true,
+    "include_returns": true
   }
 }

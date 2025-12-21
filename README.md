@@ -18,3 +18,4 @@ Notes
 - By default the SP500 dataset is downloaded with kagglehub unless `data_dir` is set.
 - The default config limits instruments to keep QUBO sizes reasonable.
 - Metrics are written to `outputs/metrics.json` unless overridden.
+- Detailed per-day histories can be toggled via `output.include_details` in the config.

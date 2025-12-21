@@ -44,6 +44,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "output": {
         "path": None,
+        "include_details": False,
+        "include_portfolios": True,
+        "include_scenarios": False,
+        "include_returns": False,
     },
 }
 

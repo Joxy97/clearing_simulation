@@ -31,6 +31,7 @@ def run_simulation(config: Dict[str, Any]) -> Dict[str, Any]:
     model_cfg = config.get("model", DEFAULT_CONFIG["model"])
     data_cfg = config.get("data", DEFAULT_CONFIG["data"])
     sim_cfg = config.get("simulation", DEFAULT_CONFIG["simulation"])
+    output_cfg = config.get("output", DEFAULT_CONFIG["output"])
 
     device = get_device(model_cfg.get("device", "auto"))
 
@@ -88,6 +89,11 @@ def run_simulation(config: Dict[str, Any]) -> Dict[str, Any]:
     if max_trades_per_client is not None:
         max_trades_per_client = int(max_trades_per_client)
 
+    include_details = bool(output_cfg.get("include_details", False))
+    include_portfolios = bool(output_cfg.get("include_portfolios", True))
+    include_scenarios = bool(output_cfg.get("include_scenarios", False))
+    include_returns = bool(output_cfg.get("include_returns", False))
+
     metrics = simulate_days(
         n_days=int(sim_cfg.get("n_days", 10)),
         clearing_members=clearing_members,
@@ -107,6 +113,10 @@ def run_simulation(config: Dict[str, Any]) -> Dict[str, Any]:
         state_index_strategy=sim_cfg.get("state_index_strategy", "random"),
         liquidate_on_default=bool(sim_cfg.get("liquidate_on_default", True)),
         cm_absorbs_shortfall=bool(sim_cfg.get("cm_absorbs_shortfall", True)),
+        include_details=include_details,
+        include_portfolios=include_portfolios,
+        include_scenarios=include_scenarios,
+        include_returns=include_returns,
     )
 
     summary = {
@@ -114,7 +124,6 @@ def run_simulation(config: Dict[str, Any]) -> Dict[str, Any]:
         "final_system": metrics[-1]["system"] if metrics else {},
     }
 
-    output_cfg = config.get("output", {})
     output_path = output_cfg.get("path") if isinstance(output_cfg, dict) else None
     payload = {"metrics": metrics, "summary": summary}
 

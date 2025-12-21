@@ -99,6 +99,10 @@ def simulate_one_day(
     state_index_strategy: str = "random",
     liquidate_on_default: bool = True,
     cm_absorbs_shortfall: bool = True,
+    include_details: bool = False,
+    include_portfolios: bool = True,
+    include_scenarios: bool = False,
+    include_returns: bool = False,
 ) -> Dict[str, Any]:
     if not clearing_members:
         raise ValueError("simulate_one_day: no clearing members provided.")
@@ -129,9 +133,33 @@ def simulate_one_day(
     system_total_zero_collateral_clients = 0
 
     cms_metrics: Dict[str, Any] = {}
+    details: Dict[str, Any] = {}
+    if include_details:
+        details["market_state"] = market_state
+        if include_returns:
+            details["real_returns"] = real_ret
+        if include_scenarios:
+            details["scenarios"] = scenarios
 
     with torch.no_grad():
         for cm_name, cm in clearing_members.items():
+            client_start = []
+            recklessness_before = []
+            if include_details:
+                for client in cm.clients:
+                    client_start.append(
+                        {
+                            "client_id": client.client_id,
+                            "liquidity_status": client.liquidity_status.name,
+                            "wealth": float(client.wealth),
+                            "collateral": float(client.collateral),
+                            "recklessness": float(client.recklessness),
+                            "vip_status": client.vip_status.name,
+                            "portfolio": client.portfolio.clone() if include_portfolios else None,
+                        }
+                    )
+                    recklessness_before.append(float(client.recklessness))
+
             for client in cm.clients:
                 client.update_recklessness()
 
@@ -160,9 +188,15 @@ def simulate_one_day(
             portfolios_cm = cm.portfolios_tensor()
             real_pnl_clients = portfolios_cm @ real_ret
 
+            income_applied = []
             for i_client, client in enumerate(cm.clients):
                 pnl_value = float(real_pnl_clients[i_client].item())
                 client.apply_pnl(pnl_value)
+                income_due = (
+                    client.liquidity_status == client.liquidity_status.LIQUID
+                    and day % client.income_frequency == 0
+                )
+                income_applied.append(bool(income_due))
                 client.apply_income_if_due(day)
 
             client_margins = margin(portfolios_cm, scenarios, alpha=alpha)
@@ -171,17 +205,29 @@ def simulate_one_day(
             needs_call = shortfall > 0
 
             default_shortfall = 0.0
+            margin_call_records = [
+                {"called": False, "amount": 0.0, "accepted": None, "liquidated": False}
+                for _ in range(len(cm.clients))
+            ]
             for i_client, client in enumerate(cm.clients):
                 if not needs_call[i_client]:
                     continue
                 M = float(shortfall[i_client].item())
                 accepted = client.margin_called(M)
+                record = {
+                    "called": True,
+                    "amount": M,
+                    "accepted": bool(accepted),
+                    "liquidated": False,
+                }
                 if not accepted:
                     if liquidate_on_default:
                         client.liquidate_portfolio()
                         client.set_collateral(0.0)
+                        record["liquidated"] = True
                     if cm_absorbs_shortfall:
                         default_shortfall += M
+                margin_call_records[i_client] = record
 
             cm_pnl = float(real_pnl_clients.sum().item())
             cm.cm_funds = max(0.0, cm.cm_funds + cm_pnl - default_shortfall)
@@ -206,6 +252,49 @@ def simulate_one_day(
                 "num_accepted_trades": num_accepted_trades,
                 "num_zero_collateral_clients": num_zero_coll,
             }
+            if include_details:
+                client_details = []
+                for i_client, client in enumerate(cm.clients):
+                    trade_list = []
+                    trade_idx = (trades[i_client] != 0.0).nonzero(as_tuple=False).flatten()
+                    for idx_trade in trade_idx.tolist():
+                        trade_list.append(
+                            {
+                                "instrument": int(idx_trade),
+                                "amount": float(trades[i_client, idx_trade].item()),
+                                "accepted": bool(accepted_mask[i_client, idx_trade].item()),
+                            }
+                        )
+
+                    entry = {
+                        "client_id": client.client_id,
+                        "vip_status": client.vip_status.name,
+                        "liquidity_status_end": client.liquidity_status.name,
+                        "wealth_end": float(client.wealth),
+                        "collateral_end": float(client.collateral),
+                        "recklessness_end": float(client.recklessness),
+                        "pnl": float(real_pnl_clients[i_client].item()),
+                        "income_applied": income_applied[i_client],
+                        "margin": float(client_margins[i_client].item()),
+                        "shortfall": float(shortfall[i_client].item()),
+                        "margin_call": margin_call_records[i_client],
+                        "trades": trade_list,
+                    }
+                    if client_start:
+                        entry["start"] = client_start[i_client]
+                        entry["recklessness_start"] = recklessness_before[i_client]
+                        entry["liquidity_status_start"] = client_start[i_client]["liquidity_status"]
+                        if include_portfolios:
+                            entry["portfolio_start"] = client_start[i_client]["portfolio"]
+                    if include_portfolios:
+                        entry["portfolio_end"] = client.portfolio.clone()
+                    client_details.append(entry)
+
+                cms_metrics[cm_name]["default_shortfall"] = default_shortfall
+                cms_metrics[cm_name]["cm_pnl"] = cm_pnl
+                cms_metrics[cm_name]["clients"] = client_details
+                if include_portfolios:
+                    cms_metrics[cm_name]["cm_portfolio"] = cm.aggregate_portfolio().clone()
 
             system_total_client_collateral += total_coll
             system_total_client_margin += total_margin
@@ -223,6 +312,8 @@ def simulate_one_day(
                 "cm_funds": snapshot["cm_funds"],
                 "cm_shortfalls": snapshot["cm_shortfalls"],
             }
+            if include_details and include_portfolios:
+                ccps_metrics[ccp_name]["net_portfolio"] = snapshot["net_portfolio"]
 
     num_clients_total = sum(len(cm.clients) for cm in clearing_members.values())
     avg_client_collateral = (
@@ -246,13 +337,16 @@ def simulate_one_day(
         "num_zero_collateral_clients": system_total_zero_collateral_clients,
     }
 
-    return {
+    payload = {
         "day": day,
         "market_index": idx,
         "system": system_metrics,
         "cms": cms_metrics,
         "ccps": ccps_metrics,
     }
+    if include_details:
+        payload["details"] = details
+    return payload
 
 
 def simulate_days(
@@ -275,6 +369,10 @@ def simulate_days(
     state_index_strategy: str = "random",
     liquidate_on_default: bool = True,
     cm_absorbs_shortfall: bool = True,
+    include_details: bool = False,
+    include_portfolios: bool = True,
+    include_scenarios: bool = False,
+    include_returns: bool = False,
 ) -> list[Dict[str, Any]]:
     metrics = []
     for day in range(n_days):
@@ -298,6 +396,10 @@ def simulate_days(
                 state_index_strategy=state_index_strategy,
                 liquidate_on_default=liquidate_on_default,
                 cm_absorbs_shortfall=cm_absorbs_shortfall,
+                include_details=include_details,
+                include_portfolios=include_portfolios,
+                include_scenarios=include_scenarios,
+                include_returns=include_returns,
             )
         )
     return metrics
