@@ -1,0 +1,402 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage[margin=1in]{geometry}
+
+\title{Clearing Simulation: Technical Overview and Debugging Guide}
+\date{}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Purpose and Mental Model (Game View)}
+This project simulates a simplified clearing system. Think of it as a game
+played in daily rounds, with three roles:
+
+\begin{description}
+  \item[Clients (players)] Hold vectors of positions in instruments, propose
+  trades, and sometimes face ``energy penalties'' (margin calls) if their risk
+  is too high.
+  \item[Clearing Members (team managers)] Hold the client roster, decide which
+  trades are accepted, and absorb losses when clients default.
+  \item[CCP (referee)] Monitors system level risk using the combined portfolios
+  of clearing members.
+\end{description}
+
+Each round, the game draws a market ``weather'' state, generates many possible
+return scenarios, allows clients to propose moves (trades), and then solves a
+binary optimization problem to accept or reject trades while penalizing risk.
+
+This is not a market microstructure simulator: there is no order book, no price
+impact, no transaction cost, and no dynamic price formation. The only prices
+used are the historical price differences from the dataset, and risk is measured
+via scenario based loss.
+
+\section{Notation}
+\begin{itemize}
+  \item $N$: number of instruments.
+  \item $C$: number of clients in a clearing member.
+  \item $S$: number of sampled scenarios per day.
+  \item $p_m \in \mathbb{R}^N$: portfolio (positions) of client $m$.
+  \item $\Delta_{m,i}$: proposed trade (position change) for client $m$ and instrument $i$.
+  \item $r_s \in \mathbb{R}^N$: scenario return vector for scenario $s$.
+  \item $r^{\mathrm{real}} \in \mathbb{R}^N$: realized return vector for the day.
+  \item $\alpha$: tail probability for Expected Shortfall (ES) margin.
+\end{itemize}
+
+\section{Data Pipeline and State Representation}
+The simulation uses SP500 open prices by default, loaded from a Kaggle dataset.
+All returns are \emph{price differences} (not percentages).
+
+\subsection{Returns}
+Let $P_t \in \mathbb{R}^N$ be the open price vector at day $t$. Returns are
+defined by simple differences:
+\[
+  r_t = P_t - P_{t-1}.
+\]
+This yields a return tensor $r$ with shape $(T,N)$ where $T$ is the number of
+days.
+
+\subsection{Market State}
+The market state at time $t$ is a 2D feature vector derived from same day
+returns:
+\[
+  V_t = \mathrm{median}_i(|r_{t,i}|), \quad
+  C_t = \left| \frac{1}{N} \sum_i r_{t,i} \right|.
+\]
+So each state is $s_t = (V_t, C_t)$ with shape $(T-1,2)$ and is aligned with
+``next day'' returns $r_{t+1}$.
+
+\subsection{State Encoding}
+States are discretized into bins and then one-hot encoded:
+\begin{itemize}
+  \item $V_t$ is binned into $K_v$ quantile bins.
+  \item $C_t$ is binned into $K_c$ quantile bins.
+\end{itemize}
+The encoded state has dimension $K_v + K_c$ and is used to condition the RBM.
+
+\subsection{Return Encoding}
+Each instrument return is encoded into 7 bits:
+\begin{itemize}
+  \item Bit 0: ``gain'' (return $\ge 0$).
+  \item Bits 1--6: six loss bins (return $< 0$), based on negative return
+  quantiles.
+\end{itemize}
+The mapping is constructed so larger losses map to larger indices. These
+one-hot vectors are concatenated across instruments, yielding $7N$ visible
+return units.
+
+\section{Scenario Generation (RBM)}
+A trained RBM (loaded from \texttt{models/run\_1}) generates return scenarios
+conditional on the market state. The RBM visible layer contains:
+\[
+  \text{state bits} \;+\; \text{return bits}.
+\]
+For each day:
+\begin{enumerate}
+  \item Choose a market state index (random or sequential).
+  \item Clamp the state bits to that one-hot state.
+  \item Sample return bits using Gibbs sampling (with burn-in and thinning).
+  \item Decode the return bits to real-valued returns using bin midpoints.
+\end{enumerate}
+Only the first $N$ instruments are used even if the RBM was trained with more.
+
+\section{Risk Model and Margin}
+Risk is computed from scenarios using Expected Shortfall (ES).
+
+\subsection{PnL and Loss}
+For a portfolio $p$, the scenario PnL and loss are:
+\[
+  \mathrm{PnL}(p, r_s) = p^\top r_s, \quad
+  L(p, r_s) = -p^\top r_s.
+\]
+Loss is positive when PnL is negative.
+
+\subsection{Expected Shortfall}
+Let $\alpha \in (0,1)$ and let $L_s$ be the loss values across scenarios.
+Define
+\[
+  \mathrm{VaR}_\alpha = \mathrm{quantile}_\alpha(L_s).
+\]
+Then ES is the average of the tail losses:
+\[
+  \mathrm{ES}_\alpha = \frac{1}{|\mathcal{T}|} \sum_{s \in \mathcal{T}} L_s,
+  \quad \mathcal{T} = \{ s : L_s \ge \mathrm{VaR}_\alpha \}.
+\]
+This ES is the margin requirement in the simulation.
+
+\subsection{Tail Mean}
+The tail mean of returns is used as a local sensitivity of margin to trades:
+\[
+  \mu_{\mathrm{tail}} = \frac{1}{|\mathcal{T}|} \sum_{s \in \mathcal{T}} r_s.
+\]
+This is computed for each client and for the aggregate CM portfolio.
+
+\section{Trade Generation and QUBO Selection}
+\subsection{Trade Proposals}
+Each liquid client proposes a trade vector $\Delta_m$:
+\begin{itemize}
+  \item Nonzero positions are perturbed by Gaussian noise scaled by
+  \texttt{recklessness}.
+  \item Zero positions have a small chance of opening a new position.
+  \item Default or bankrupt clients propose zero trades.
+\end{itemize}
+
+\subsection{Active Trades}
+Trades are filtered by magnitude:
+\begin{itemize}
+  \item Only trades with $|\Delta_{m,i}| >$ \texttt{min\_trade\_abs} are active.
+  \item If \texttt{max\_trades\_per\_client} is set, keep only the largest
+  trades by absolute value for each client.
+\end{itemize}
+Active trades become binary decision variables $x_k \in \{0,1\}$.
+
+\subsection{Local Margin Sensitivity}
+For each active trade (client $m$, instrument $i$):
+\[
+  a^{\mathrm{client}}_{m,i} = -\Delta_{m,i} \, \mu^{\mathrm{client}}_{\mathrm{tail},i},
+  \quad
+  a^{\mathrm{cm}}_{m,i} = -\Delta_{m,i} \, \mu^{\mathrm{cm}}_{\mathrm{tail},i}.
+\]
+These are linearized approximations of how margin changes with the trade.
+
+\subsection{QUBO Objective}
+The QUBO minimizes a quadratic energy:
+\[
+  E(x) = \sum_k (-v_k) x_k
+  + \lambda_{\mathrm{cm}} \left( A_{\mathrm{cm}} + \sum_k a^{\mathrm{cm}}_k x_k \right)^2
+  + \lambda_{\mathrm{client}} \sum_m
+    \left( A_m + \sum_{k \in m} a^{\mathrm{client}}_k x_k \right)^2
+\]
+where:
+\[
+  v_k = \texttt{trade\_value\_scale} \cdot \Delta_k,
+  \quad A_{\mathrm{cm}} = M^{0}_{\mathrm{cm}} - \texttt{cm\_funds},
+  \quad A_m = M^{0}_m - \texttt{collateral}_m.
+\]
+Here $M^0$ is the current ES margin before trades. The first term rewards trade
+value, while the penalty terms enforce margin limits. The QUBO is solved with
+simulated annealing (\texttt{dwave.samplers}).
+
+\section{Daily Simulation Cycle}
+For each day:
+\begin{enumerate}
+  \item Choose a market state and sample $S$ return scenarios.
+  \item Each client updates recklessness, then proposes trades.
+  \item The CM builds and solves a QUBO to accept or reject trades.
+  \item Accepted trades update client portfolios.
+  \item Realized returns apply PnL to wealth.
+  \item Income is added on scheduled days.
+  \item ES margin is computed for each client.
+  \item Margin calls occur if margin $>$ collateral.
+  \item Defaults trigger liquidation (optional) and CM absorbs shortfall (optional).
+  \item CCP computes CM margins and system net margin.
+\end{enumerate}
+
+\section{Parameters and Their Meaning}
+Configuration is loaded from \texttt{configs/default.json} or the CLI override.
+
+\subsection{Model}
+\begin{description}
+  \item[\texttt{model.run\_folder}] Path to RBM run (config and model weights).
+  \item[\texttt{model.device}] \texttt{auto}, \texttt{cpu}, \texttt{cuda:0}, or \texttt{mps}.
+\end{description}
+
+\subsection{Data}
+\begin{description}
+  \item[\texttt{data.source}] Only \texttt{sp500} is supported.
+  \item[\texttt{data.data\_dir}] Optional local dataset path.
+  \item[\texttt{data.K\_v}, \texttt{data.K\_c}] Number of bins for $V$ and $C$.
+  \item[\texttt{data.loss\_percentiles}] Edges for negative return bins.
+  \item[\texttt{data.limit\_instruments}] Limit $N$ to keep QUBO small.
+\end{description}
+
+\subsection{Simulation}
+\begin{description}
+  \item[\texttt{simulation.n\_days}] Number of simulated days.
+  \item[\texttt{simulation.scenarios\_per\_day}] Scenario count $S$.
+  \item[\texttt{simulation.burn\_in}, \texttt{simulation.thin}] RBM sampling controls.
+  \item[\texttt{simulation.alpha}] ES tail level $\alpha$.
+  \item[\texttt{simulation.lambda\_client}, \texttt{simulation.lambda\_cm}] QUBO penalties.
+  \item[\texttt{simulation.trade\_value\_scale}] Linear reward for accepted trades.
+  \item[\texttt{simulation.min\_trade\_abs}] Minimum active trade size.
+  \item[\texttt{simulation.max\_trades\_per\_client}] Cap active trades per client.
+  \item[\texttt{simulation.state\_index\_strategy}] \texttt{random} or \texttt{sequential}.
+  \item[\texttt{simulation.init\_scenarios}] Scenarios used to set initial collateral.
+  \item[\texttt{simulation.liquidate\_on\_default}] If true, zero portfolio and collateral.
+  \item[\texttt{simulation.cm\_absorbs\_shortfall}] If true, CM funds pay defaults.
+\end{description}
+
+\subsection{Structure}
+\begin{description}
+  \item[\texttt{clearing\_members}] Each CM has \texttt{n\_clients} and \texttt{cm\_funds}.
+  \item[\texttt{ccps}] Each CCP defines \texttt{instrument\_indices} and \texttt{default\_fund}.
+\end{description}
+Note: \texttt{default\_fund} is stored but not used in current margin logic.
+
+\subsection{Output}
+\begin{description}
+  \item[\texttt{output.path}] Path to metrics JSON.
+  \item[\texttt{output.include\_details}] Include per-client and scenario details.
+  \item[\texttt{output.include\_portfolios}] Include portfolio vectors in output.
+  \item[\texttt{output.include\_scenarios}] Include sampled scenarios in output.
+  \item[\texttt{output.include\_returns}] Include realized returns in output.
+\end{description}
+
+\section{Output Metrics}
+Each day produces:
+\begin{itemize}
+  \item \texttt{system}: total collateral, total CM funds, active and accepted trades.
+  \item \texttt{cms}: per CM totals and per client details (if enabled).
+  \item \texttt{ccps}: CCP margin, CM margins, and shortfalls.
+  \item \texttt{details}: market state, scenarios, and realized returns (optional).
+\end{itemize}
+The Streamlit viewer in \texttt{app.py} can render detailed metrics.
+
+\section{Debugging by Hand: A Minimal Worked Example}
+This example uses tiny numbers to make the math transparent. We bypass the RBM
+and assume scenarios are already given.
+
+\subsection{Setup}
+One CM, one client, two instruments ($N=2$). Five scenarios ($S=5$). Choose
+$\alpha = 0.75$.
+
+Scenario returns:
+\[
+  r_1 = (1,1),\;
+  r_2 = (-1,1),\;
+  r_3 = (1,-1),\;
+  r_4 = (-1,0),\;
+  r_5 = (-2,-1).
+\]
+Initial portfolio:
+\[
+  p = (1,1).
+\]
+Collateral $= 1.0$, CM funds $= 1.5$, $\lambda_{\mathrm{client}} = \lambda_{\mathrm{cm}} = 0.1$.
+
+\subsection{Step 1: Margin for the Current Portfolio}
+Compute losses $L_s = -p^\top r_s$:
+\[
+  L = [-2, 0, 0, 1, 3].
+\]
+Sorted losses are $[-2, 0, 0, 1, 3]$. With $S=5$ and $\alpha=0.75$,
+the quantile index is $(S-1)\alpha = 3$, so $\mathrm{VaR}_{0.75}=1$.
+
+Tail set $\mathcal{T} = \{ s : L_s \ge 1 \} = \{4,5\}$.
+\[
+  \mathrm{ES}_{0.75} = \frac{1 + 3}{2} = 2.
+\]
+Tail mean returns:
+\[
+  \mu_{\mathrm{tail}} = \frac{r_4 + r_5}{2} = (-1.5, -0.5).
+\]
+
+\subsection{Step 2: Build the QUBO for Two Trades}
+Suppose the client proposes two trades:
+\[
+  \Delta_1 = +1 \text{ on instrument 1}, \quad
+  \Delta_2 = -2 \text{ on instrument 2}.
+\]
+Compute $a$ values:
+\[
+  a_1 = -\Delta_1 \mu_{\mathrm{tail},1} = -1 \cdot (-1.5) = 1.5,
+  \quad
+  a_2 = -\Delta_2 \mu_{\mathrm{tail},2} = -(-2)\cdot(-0.5) = -1.
+\]
+Compute margins vs funds:
+\[
+  A_{\mathrm{client}} = M^0 - \text{collateral} = 2 - 1 = 1,
+  \quad
+  A_{\mathrm{cm}} = 2 - 1.5 = 0.5.
+\]
+Trade value terms: $v = [1, -2]$.
+
+Assemble the QUBO (matrix form):
+\[
+  Q =
+  \begin{bmatrix}
+    -v_1 & 0 \\
+    0 & -v_2
+  \end{bmatrix}
+  + 0.1 \cdot (a a^\top + 2 A_{\mathrm{cm}} \mathrm{diag}(a))
+  + 0.1 \cdot (a a^\top + 2 A_{\mathrm{client}} \mathrm{diag}(a)).
+\]
+Evaluating gives:
+\[
+  Q = \begin{bmatrix} -0.1 & -0.3 \\ -0.3 & 1.9 \end{bmatrix}.
+\]
+
+The energy of each trade decision $x = (x_1, x_2)$ is
+\[
+  E(x) = Q_{11} x_1 + Q_{22} x_2 + Q_{12} x_1 x_2.
+\]
+Thus:
+\[
+  E(0,0) = 0,\quad
+  E(1,0) = -0.1,\quad
+  E(0,1) = 1.9,\quad
+  E(1,1) = 1.5.
+\]
+The minimum is $x=(1,0)$, so trade 1 is accepted, trade 2 is rejected.
+
+\subsection{Step 3: Apply Trades and Realized Returns}
+New portfolio:
+\[
+  p' = (2,1).
+\]
+Choose a realized return for the day (from the dataset):
+\[
+  r^{\mathrm{real}} = (-1, 1).
+\]
+Realized PnL:
+\[
+  \mathrm{PnL} = p'^\top r^{\mathrm{real}} = 2(-1) + 1(1) = -1.
+\]
+Wealth decreases by 1. Collateral is unchanged until margin calls.
+
+\subsection{Step 4: Margin Call Check}
+Compute losses for $p'$:
+\[
+  L' = -p'^\top r_s = [-3, 1, -1, 2, 5].
+\]
+Sorted losses: $[-3, -1, 1, 2, 5]$.
+At $\alpha=0.75$, $\mathrm{VaR}=2$, and tail losses are $\{2,5\}$.
+\[
+  \mathrm{ES} = \frac{2 + 5}{2} = 3.5.
+\]
+Shortfall:
+\[
+  \text{shortfall} = 3.5 - \text{collateral} = 2.5.
+\]
+If the client accepts the margin call, collateral increases by 2.5 and wealth
+decreases by 2.5. If the client rejects, status becomes \texttt{DEFAULT}; the
+portfolio may be liquidated and the CM may absorb the shortfall, depending on
+configuration.
+
+\section{Practical Debugging Checklist}
+\begin{itemize}
+  \item Check shapes: portfolios $(C,N)$, scenarios $(S,N)$, trades $(C,N)$.
+  \item Verify state and return encoding dimensions ($K_v + K_c$, $7N$).
+  \item Confirm that ES uses loss $L = -p^\top r$ (sign matters).
+  \item Validate the QUBO by computing $Q$ for a single client and a few trades.
+  \item In a small example, enumerate all $x \in \{0,1\}^K$ to confirm the solver.
+  \item Ensure margin calls happen after PnL and income updates.
+  \item Check that defaults stop new trades for that client.
+\end{itemize}
+
+\section{Where to Look in the Code}
+\begin{itemize}
+  \item Simulation loop: \texttt{src/clearing\_simulation/simulation.py}
+  \item QUBO construction: \texttt{src/clearing\_simulation/qubo.py}
+  \item Risk metrics: \texttt{src/clearing\_simulation/risk.py}
+  \item Scenario sampling: \texttt{src/clearing\_simulation/scenario.py}
+  \item Encoding: \texttt{src/clearing\_simulation/encoding.py}
+  \item Dataset prep: \texttt{src/clearing\_simulation/dataset.py}
+  \item Runner and config: \texttt{src/clearing\_simulation/runner.py},
+        \texttt{src/clearing\_simulation/config.py}
+\end{itemize}
+
+\end{document}
