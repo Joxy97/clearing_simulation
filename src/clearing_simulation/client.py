@@ -128,6 +128,10 @@ class Client:
         return delta
 
     def margin_called(self, amount: float) -> bool:
+        """Handle a market margin call (due to portfolio risk exceeding collateral).
+
+        If rejected, client defaults.
+        """
         if self.liquidity_status != LiquidityStatus.LIQUID:
             return False
         if amount <= self.recklessness * self.wealth:
@@ -140,6 +144,26 @@ class Client:
             self._update_liquidity_status()
             return True
         self.liquidity_status = LiquidityStatus.DEFAULT
+        return False
+
+    def trade_margin_called(self, amount: float) -> bool:
+        """Handle a trade margin call (to enable a rejected trade).
+
+        Unlike market margin calls, rejecting a trade margin call does NOT
+        cause the client to default - the trade simply remains rejected.
+        """
+        if self.liquidity_status != LiquidityStatus.LIQUID:
+            return False
+        if amount <= self.recklessness * self.wealth:
+            self.wealth -= amount
+            self.collateral += amount
+            self.wealth_history.append(self.wealth)
+            self.collateral_history.append(self.collateral)
+            self.top_up_history.append(amount)
+            self._update_top_up_trust()
+            self._update_liquidity_status()
+            return True
+        # Trade margin call rejection does NOT cause default
         return False
 
     def apply_pnl(self, pnl_value: float) -> None:

@@ -14,8 +14,8 @@
     "limit_instruments": 5
   },
   "simulation": {
-    "n_days": 2,
-    "scenarios_per_day": 10,
+    "n_days": 100,
+    "scenarios_per_day": 1000,
     "burn_in": 500,
     "thin": 10,
     "alpha": 0.99,
@@ -25,12 +25,13 @@
     "min_trade_abs": 1e-6,
     "max_trades_per_client": 30,
     "state_index_strategy": "random",
-    "init_scenarios": 500,
+    "init_scenarios": 1000,
     "liquidate_on_default": true,
-    "cm_absorbs_shortfall": true
+    "cm_absorbs_shortfall": true,
+    "allow_trade_topups": true
   },
   "clearing_members": {
-    "CM": {"n_clients": 3, "cm_funds": 10000.0}
+    "CM": {"n_clients": 1, "cm_funds": 10000.0}
   },
   "ccps": {
     "CCP": {"instrument_indices": "all", "default_fund": 100000.0}

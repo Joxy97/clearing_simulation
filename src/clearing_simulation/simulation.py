@@ -8,6 +8,7 @@ from .client import Client
 from .clearing_member import ClearingMember
 from .ccp import CCP
 from .risk import margin
+from .qubo import compute_trade_margin_requirements
 
 
 def make_margin_func(scenarios: torch.Tensor, alpha: float) -> Any:
@@ -99,6 +100,7 @@ def simulate_one_day(
     state_index_strategy: str = "random",
     liquidate_on_default: bool = True,
     cm_absorbs_shortfall: bool = True,
+    allow_trade_topups: bool = False,
     include_details: bool = False,
     include_portfolios: bool = True,
     include_scenarios: bool = False,
@@ -183,6 +185,58 @@ def simulate_one_day(
             x_sol = qubo_info["x"]
             num_accepted_trades = int(x_sol.sum().item()) if x_sol.numel() > 0 else 0
 
+            # Trade margin call logic: offer rejected trades a chance to be accepted
+            # if client tops up collateral
+            trade_margin_call_records = [
+                [] for _ in range(len(cm.clients))
+            ]
+            if allow_trade_topups:
+                # Find rejected trades (proposed but not accepted)
+                proposed_mask = (trades != 0.0)
+                rejected_mask = proposed_mask & ~accepted_mask
+
+                if rejected_mask.any():
+                    portfolios_cm = cm.portfolios_tensor()
+                    collaterals_cm = cm.collaterals_tensor()
+
+                    # Compute required top-up for each rejected trade
+                    required_topups = compute_trade_margin_requirements(
+                        portfolios=portfolios_cm,
+                        trades=trades,
+                        collaterals=collaterals_cm,
+                        scenarios=scenarios,
+                        rejected_mask=rejected_mask,
+                        alpha=alpha,
+                    )
+
+                    # Offer trade margin calls to clients for each rejected trade
+                    for i_client, client in enumerate(cm.clients):
+                        rejected_instruments = rejected_mask[i_client].nonzero(as_tuple=False).flatten()
+                        for i in rejected_instruments.tolist():
+                            required = float(required_topups[i_client, i].item())
+                            if required <= 0:
+                                # No additional margin needed, accept the trade
+                                accepted_mask[i_client, i] = True
+                                num_accepted_trades += 1
+                                trade_margin_call_records[i_client].append({
+                                    "instrument": i,
+                                    "amount": 0.0,
+                                    "accepted": True,
+                                    "trade_accepted": True,
+                                })
+                            else:
+                                # Issue trade margin call
+                                call_accepted = client.trade_margin_called(required)
+                                if call_accepted:
+                                    accepted_mask[i_client, i] = True
+                                    num_accepted_trades += 1
+                                trade_margin_call_records[i_client].append({
+                                    "instrument": i,
+                                    "amount": required,
+                                    "accepted": call_accepted,
+                                    "trade_accepted": call_accepted,
+                                })
+
             cm.execute_trades(day, trades, accepted_mask)
 
             portfolios_cm = cm.portfolios_tensor()
@@ -205,7 +259,8 @@ def simulate_one_day(
             needs_call = shortfall > 0
 
             default_shortfall = 0.0
-            margin_call_records = [
+            # Market margin calls (due to portfolio risk from market moves)
+            market_margin_call_records = [
                 {"called": False, "amount": 0.0, "accepted": None, "liquidated": False}
                 for _ in range(len(cm.clients))
             ]
@@ -227,7 +282,7 @@ def simulate_one_day(
                         record["liquidated"] = True
                     if cm_absorbs_shortfall:
                         default_shortfall += M
-                margin_call_records[i_client] = record
+                market_margin_call_records[i_client] = record
 
             cm_pnl = float(real_pnl_clients.sum().item())
             cm.cm_funds = max(0.0, cm.cm_funds + cm_pnl - default_shortfall)
@@ -277,7 +332,8 @@ def simulate_one_day(
                         "income_applied": income_applied[i_client],
                         "margin": float(client_margins[i_client].item()),
                         "shortfall": float(shortfall[i_client].item()),
-                        "margin_call": margin_call_records[i_client],
+                        "market_margin_call": market_margin_call_records[i_client],
+                        "trade_margin_calls": trade_margin_call_records[i_client],
                         "trades": trade_list,
                     }
                     if client_start:
@@ -369,6 +425,7 @@ def simulate_days(
     state_index_strategy: str = "random",
     liquidate_on_default: bool = True,
     cm_absorbs_shortfall: bool = True,
+    allow_trade_topups: bool = False,
     include_details: bool = False,
     include_portfolios: bool = True,
     include_scenarios: bool = False,
@@ -396,6 +453,7 @@ def simulate_days(
                 state_index_strategy=state_index_strategy,
                 liquidate_on_default=liquidate_on_default,
                 cm_absorbs_shortfall=cm_absorbs_shortfall,
+                allow_trade_topups=allow_trade_topups,
                 include_details=include_details,
                 include_portfolios=include_portfolios,
                 include_scenarios=include_scenarios,

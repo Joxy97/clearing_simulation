@@ -14,7 +14,6 @@
 - Redefine trade utility as a sign-neutral “importance” score (volume, fee proxy, or risk-reduction proxy) and use that in the linear term instead of signed delta.
 - Incorporate the trust buffer into QUBO inputs (effective collateral) so it actually affects acceptance decisions.
 - Normalize returns (pct/log or z-scored per instrument) to remove price-level bias.
-- Increase `scenarios_per_day` or lower `alpha` for more stable ES when comparing solvers.
 
 ## Assumptions / Questions
 - Are short positions intended to be risk-realistic? If yes, gains must be represented; if no, clamp portfolios/trades to nonnegative.
@@ -23,6 +22,3 @@
 ## Current State Summary
 - End-to-end pipeline is in place (RBM scenarios → ES margins → QUBO trade selection → clearing/margin calls).
 - Core logic is coherent for a toy model, but several modeling choices currently bias results in ways unrelated to solver quality.
-
-## Testing
-- Not run (review only).

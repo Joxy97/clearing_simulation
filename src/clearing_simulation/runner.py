@@ -113,6 +113,7 @@ def run_simulation(config: Dict[str, Any]) -> Dict[str, Any]:
         state_index_strategy=sim_cfg.get("state_index_strategy", "random"),
         liquidate_on_default=bool(sim_cfg.get("liquidate_on_default", True)),
         cm_absorbs_shortfall=bool(sim_cfg.get("cm_absorbs_shortfall", True)),
+        allow_trade_topups=bool(sim_cfg.get("allow_trade_topups", False)),
         include_details=include_details,
         include_portfolios=include_portfolios,
         include_scenarios=include_scenarios,

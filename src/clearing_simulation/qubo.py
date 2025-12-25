@@ -83,7 +83,7 @@ def build_qubo_matrix(
     deltas = trades[active_ix[:, 0], active_ix[:, 1]]
     a_client = -deltas * tail_mean_client[active_ix[:, 0], active_ix[:, 1]]
     a_cm = -deltas * tail_mean_cm[active_ix[:, 1]]
-    v_k = trade_value_scale * deltas
+    v_k = trade_value_scale * deltas.abs()
 
     Q = torch.zeros((K, K), dtype=torch.float32, device=device)
     Q.diagonal().add_(-v_k)
@@ -104,6 +104,62 @@ def build_qubo_matrix(
             Q[idx, idx] += lambda_client * (2.0 * A_m * a_m)
 
     return Q, active_ix, M0_client, M0_cm
+
+
+@torch.no_grad()
+def compute_trade_margin_requirements(
+    portfolios: torch.Tensor,
+    trades: torch.Tensor,
+    collaterals: torch.Tensor,
+    scenarios: torch.Tensor,
+    rejected_mask: torch.Tensor,
+    alpha: float = 0.99,
+) -> torch.Tensor:
+    """Compute the additional margin required for each rejected trade.
+
+    For each rejected trade, calculates how much additional collateral the client
+    would need to post for the trade to be margin-acceptable.
+
+    Returns:
+        Tensor of shape (C, I) with the required top-up amount for each rejected trade.
+        Trades that were not rejected have value 0.
+    """
+    device = portfolios.device
+    C, I = trades.shape
+    required_topups = torch.zeros((C, I), dtype=torch.float32, device=device)
+
+    from .risk import margin
+
+    for m in range(C):
+        rejected_instruments = rejected_mask[m].nonzero(as_tuple=False).flatten()
+        if rejected_instruments.numel() == 0:
+            continue
+
+        current_portfolio = portfolios[m]
+        current_margin = margin(current_portfolio.unsqueeze(0), scenarios, alpha=alpha)[0]
+        current_collateral = collaterals[m]
+
+        for i in rejected_instruments.tolist():
+            trade_delta = trades[m, i]
+            if trade_delta == 0:
+                continue
+
+            # Compute margin with this trade added
+            new_portfolio = current_portfolio.clone()
+            new_portfolio[i] += trade_delta
+            new_margin = margin(new_portfolio.unsqueeze(0), scenarios, alpha=alpha)[0]
+
+            # Required top-up = max(0, new_margin - current_collateral)
+            # This is how much extra collateral is needed to cover the new position
+            margin_increase = new_margin - current_margin
+            current_shortfall = max(0.0, float(current_margin - current_collateral))
+            new_shortfall = max(0.0, float(new_margin - current_collateral))
+
+            # The trade margin call is for the incremental shortfall caused by this trade
+            required = max(0.0, new_shortfall - current_shortfall)
+            required_topups[m, i] = required
+
+    return required_topups
 
 
 def qubo_to_bqm(Q: torch.Tensor) -> dimod.BinaryQuadraticModel:
