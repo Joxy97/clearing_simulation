@@ -14,8 +14,8 @@
     "limit_instruments": 5
   },
   "simulation": {
-    "n_days": 10,
-    "scenarios_per_day": 500,
+    "n_days": 2,
+    "scenarios_per_day": 10,
     "burn_in": 500,
     "thin": 10,
     "alpha": 0.99,
@@ -30,10 +30,10 @@
     "cm_absorbs_shortfall": true
   },
   "clearing_members": {
-    "CM": {"n_clients": 10, "cm_funds": 100000.0}
+    "CM": {"n_clients": 3, "cm_funds": 10000.0}
   },
   "ccps": {
-    "CCP": {"instrument_indices": "all", "default_fund": 10000000.0}
+    "CCP": {"instrument_indices": "all", "default_fund": 100000.0}
   },
   "output": {
     "path": "outputs/metrics.json",
