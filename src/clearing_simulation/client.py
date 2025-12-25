@@ -63,8 +63,6 @@ class Client:
         self.collateral_history: List[float] = [self.collateral]
 
         self.pnl_history: List[float] = []
-        self.top_up_history: List[float] = []
-        self.top_up_trust: float = 0.0
 
         self.current_trades: List[Trade] = []
         self.trades_history: List[Trade] = []
@@ -86,13 +84,6 @@ class Client:
         if ratio < 800:
             return VipStatus.MEDIUM
         return VipStatus.HIGH
-
-    def _update_top_up_trust(self) -> None:
-        if not self.top_up_history:
-            self.top_up_trust = 0.0
-            return
-        vals = torch.tensor(self.top_up_history, dtype=torch.float32, device=self.device)
-        self.top_up_trust = float(torch.quantile(vals, 0.01))
 
     def _update_liquidity_status(self) -> None:
         if self.wealth <= 0 and self.liquidity_status == LiquidityStatus.LIQUID:
@@ -139,8 +130,6 @@ class Client:
             self.collateral += amount
             self.wealth_history.append(self.wealth)
             self.collateral_history.append(self.collateral)
-            self.top_up_history.append(amount)
-            self._update_top_up_trust()
             self._update_liquidity_status()
             return True
         self.liquidity_status = LiquidityStatus.DEFAULT
@@ -159,8 +148,6 @@ class Client:
             self.collateral += amount
             self.wealth_history.append(self.wealth)
             self.collateral_history.append(self.collateral)
-            self.top_up_history.append(amount)
-            self._update_top_up_trust()
             self._update_liquidity_status()
             return True
         # Trade margin call rejection does NOT cause default
