@@ -89,7 +89,9 @@ def build_qubo_matrix(
     Q.diagonal().add_(-v_k)
 
     if lambda_cm != 0.0:
-        A_cm = M0_cm - float(cm_funds)
+        # Use max(0, ...) to convert equality constraint to inequality:
+        # Only penalize when margin exceeds funds (shortfall), not when there's excess
+        A_cm = max(0.0, M0_cm - float(cm_funds))
         Q += lambda_cm * torch.outer(a_cm, a_cm)
         Q.diagonal().add_(lambda_cm * (2.0 * A_cm * a_cm))
 
@@ -99,7 +101,9 @@ def build_qubo_matrix(
             if idx.numel() == 0:
                 continue
             a_m = a_client[idx]
-            A_m = M0_client[m] - float(collaterals[m])
+            # Use max(0, ...) to convert equality constraint to inequality:
+            # Only penalize when margin exceeds collateral (shortfall), not when there's excess
+            A_m = max(0.0, float(M0_client[m]) - float(collaterals[m]))
             Q[idx[:, None], idx] += lambda_client * torch.outer(a_m, a_m)
             Q[idx, idx] += lambda_client * (2.0 * A_m * a_m)
 
