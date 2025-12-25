@@ -97,6 +97,7 @@ class ReturnEncoderParams:
     loss_quantiles: List[float]
     loss_edges_by_inst: torch.Tensor
     N: int
+    gain_midpoint_by_inst: Optional[torch.Tensor] = None
 
 
 def encode_returns(
@@ -121,6 +122,7 @@ def encode_returns(
         if train_slice is None:
             raise ValueError("fit=True requires train_slice")
         loss_edges = torch.empty((N, len(percentiles)), device=device, dtype=torch.float32)
+        gain_midpoints = torch.empty(N, device=device, dtype=torch.float32)
         for i in range(N):
             r_tr = X[train_slice, i]
             neg = r_tr[r_tr < 0]
@@ -128,10 +130,17 @@ def encode_returns(
                 neg = torch.tensor([-1.0, -eps], device=device, dtype=torch.float32)
             edges_i = _quantile_edges_1d(neg, qs=percentiles, eps=eps)
             loss_edges[i] = edges_i
+            # Compute midpoint for gains (non-negative returns)
+            pos = r_tr[r_tr >= 0]
+            if pos.numel() == 0:
+                gain_midpoints[i] = eps  # fallback to small positive value
+            else:
+                gain_midpoints[i] = pos.mean()
         params = ReturnEncoderParams(
             loss_quantiles=percentiles,
             loss_edges_by_inst=loss_edges,
             N=N,
+            gain_midpoint_by_inst=gain_midpoints,
         )
     else:
         if params is None:
@@ -188,6 +197,9 @@ def build_return_midpoints(params: ReturnEncoderParams, device: Optional[torch.d
     mid_loss = torch.flip(mid_neg, dims=[1])
     rep = torch.zeros((params.N, 7), device=edges.device, dtype=torch.float32)
     rep[:, 1:] = mid_loss
+    # Use gain midpoints for bin 0 instead of 0.0
+    if params.gain_midpoint_by_inst is not None:
+        rep[:, 0] = params.gain_midpoint_by_inst.to(device=edges.device)
     if device is not None:
         rep = rep.to(device)
     return rep
