@@ -1,7 +1,7 @@
 ﻿{
   "seed": 123,
   "model": {
-    "run_folder": "models/run_1",
+    "run_folder": "boltzmann_machine/output/run_1",
     "device": "auto"
   },
   "data": {

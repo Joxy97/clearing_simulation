@@ -5,13 +5,15 @@ import torch
 
 def prices_to_returns(prices: torch.Tensor) -> torch.Tensor:
     """
+    Compute simple percentage returns: (P_t - P_{t-1}) / P_{t-1}.
+
     prices: (T, N) float
-    returns: (T, N) float, diff with first row = 0
+    returns: (T, N) float, percentage returns with first row = 0
     """
     if prices.ndim != 2:
         raise ValueError(f"prices must be (T,N), got {tuple(prices.shape)}")
     rets = torch.zeros_like(prices)
-    rets[1:] = prices[1:] - prices[:-1]
+    rets[1:] = (prices[1:] - prices[:-1]) / prices[:-1].clamp(min=1e-8)
     return rets
 
 
