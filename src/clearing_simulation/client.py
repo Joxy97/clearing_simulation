@@ -159,6 +159,10 @@ class Client:
         self.pnl_history.append(pnl_value)
         self._update_liquidity_status()
 
+    def apply_variation_margin(self, pnl_value: float) -> None:
+        """Apply end-of-day variation margin (settles PnL to wealth)."""
+        self.apply_pnl(pnl_value)
+
     def apply_income_if_due(self, day: int) -> None:
         if self.liquidity_status != LiquidityStatus.LIQUID:
             return

@@ -1,5 +1,5 @@
 ﻿{
-  "seed": 123,
+  "seed": 42,
   "model": {
     "run_folder": "boltzmann_machine/output/run_1",
     "device": "auto"
@@ -7,7 +7,7 @@
   "data": {
     "source": "sp500",
     "data_dir": null,
-    "train_ratio": 0.8,
+    "train_ratio": 1.0,
     "K_v": 4,
     "K_c": 4,
     "loss_percentiles": [0.0, 0.01, 0.05, 0.10, 0.25, 0.40, 0.60],
@@ -28,13 +28,18 @@
     "init_scenarios": 1000,
     "liquidate_on_default": true,
     "cm_absorbs_shortfall": true,
-    "allow_trade_topups": true
+    "allow_trade_topups": false
+  },
+  "clients": {
+    "income_range": [20, 2000],
+    "income_frequency_range": [7, 30]
   },
   "clearing_members": {
-    "CM": {"n_clients": 1, "cm_funds": 10000.0}
+    "CM1": {"n_clients": 2, "cm_funds": 1000.0},
+    "CM2": {"n_clients": 2, "cm_funds": 1000.0}
   },
   "ccps": {
-    "CCP": {"instrument_indices": "all", "default_fund": 100000.0}
+    "CCP": {"instrument_indices": "all", "default_fund": 2000.0}
   },
   "output": {
     "path": "outputs/metrics.json",

@@ -42,24 +42,45 @@ def run_simulation(config: Dict[str, Any]) -> Dict[str, Any]:
     if data_dir is None:
         data_dir = download_sp500_dataset()
 
-    prices = load_sp500_open_prices(
-        data_dir,
-        limit_instruments=data_cfg.get("limit_instruments"),
-    )
+    # Load full universe for encoder consistency with the RBM training set.
+    prices = load_sp500_open_prices(data_dir)
+
+    encoder_fit_ratio = float(data_cfg.get("train_ratio", 1.0))
+    if not 0.0 < encoder_fit_ratio <= 1.0:
+        raise ValueError("data.train_ratio must be in (0, 1].")
+    if encoder_fit_ratio < 1.0:
+        raise ValueError("Encoder fit must use the full dataset to match the RBM training set.")
 
     dataset = prepare_dataset(
         prices,
         K_v=int(data_cfg.get("K_v", 4)),
         K_c=int(data_cfg.get("K_c", 4)),
         loss_percentiles=data_cfg.get("loss_percentiles"),
-        train_ratio=float(data_cfg.get("train_ratio", 0.8)),
+        train_ratio=encoder_fit_ratio,
     )
 
     model = load_rbm(model_cfg.get("run_folder", "models/run_1"), device)
+    expected_nv = dataset.state_oh.shape[1] + dataset.ret_params.N * 7
+    if model.nv != expected_nv:
+        raise ValueError(
+            f"RBM visible size mismatch: model.nv={model.nv}, expected={expected_nv}."
+        )
+
+    full_n = dataset.returns_next.shape[1]
+    limit_instruments = data_cfg.get("limit_instruments")
+    if limit_instruments is None:
+        n_instruments = full_n
+    else:
+        n_instruments = int(limit_instruments)
+        if n_instruments <= 0 or n_instruments > full_n:
+            raise ValueError(
+                f"limit_instruments must be in [1, {full_n}], got {n_instruments}."
+            )
+
     scenario_gen = ScenarioGenerator(
         model=model,
         ret_params=dataset.ret_params,
-        n_instruments=dataset.returns_next.shape[1],
+        n_instruments=n_instruments,
     )
 
     idx0 = int(torch.randint(0, dataset.state_oh.size(0), (1,)).item())
@@ -74,14 +95,15 @@ def run_simulation(config: Dict[str, Any]) -> Dict[str, Any]:
     margin_func = make_margin_func(init_scenarios, alpha=float(sim_cfg.get("alpha", 0.99)))
     clearing_members = build_clearing_members(
         config.get("clearing_members", DEFAULT_CONFIG["clearing_members"]),
-        n_instruments=dataset.returns_next.shape[1],
+        n_instruments=n_instruments,
         margin_func=margin_func,
         device=device,
+        client_spec=config.get("clients", DEFAULT_CONFIG.get("clients", {})),
     )
     ccps = build_ccps(
         config.get("ccps", DEFAULT_CONFIG["ccps"]),
         clearing_members=clearing_members,
-        n_instruments=dataset.returns_next.shape[1],
+        n_instruments=n_instruments,
         device=device,
     )
 
@@ -100,7 +122,7 @@ def run_simulation(config: Dict[str, Any]) -> Dict[str, Any]:
         ccps=ccps,
         scenario_gen=scenario_gen,
         state_oh=dataset.state_oh,
-        returns_next=dataset.returns_next,
+        returns_next=dataset.returns_next[:, :n_instruments],
         alpha=float(sim_cfg.get("alpha", 0.99)),
         scenarios_per_day=int(sim_cfg.get("scenarios_per_day", 1000)),
         burn_in=int(sim_cfg.get("burn_in", 500)),

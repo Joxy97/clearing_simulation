@@ -13,17 +13,23 @@ from .qubo import build_qubo_matrix, solve_qubo
 class ClearingMember:
     clients: List[Client]
     cm_funds: float
+    cm_wealth: Optional[float] = None
     name: Optional[str] = None
     device: Optional[torch.device] = None
 
     cm_portfolio_history: List[torch.Tensor] = field(default_factory=list)
     cm_margin_history: List[float] = field(default_factory=list)
+    cm_wealth_history: List[float] = field(default_factory=list)
+    liquidity_status: LiquidityStatus = LiquidityStatus.LIQUID
 
     def __post_init__(self) -> None:
         if self.device is None:
             self.device = self.clients[0].device if self.clients else torch.device("cpu")
         if self.clients:
             self.cm_portfolio_history.append(self.aggregate_portfolio())
+        if self.cm_wealth is None:
+            self.cm_wealth = float(self.cm_funds)
+        self.cm_wealth_history.append(float(self.cm_wealth))
 
     def portfolios_tensor(self) -> torch.Tensor:
         if not self.clients:
@@ -54,6 +60,8 @@ class ClearingMember:
     def propose_trades(self) -> torch.Tensor:
         if not self.clients:
             raise ValueError("ClearingMember has no clients.")
+        if self.liquidity_status != LiquidityStatus.LIQUID:
+            return torch.stack([torch.zeros_like(c.portfolio) for c in self.clients], dim=0).to(self.device)
         trades_list: List[torch.Tensor] = []
         for c in self.clients:
             if c.liquidity_status in (LiquidityStatus.DEFAULT, LiquidityStatus.BANKRUPT):
@@ -80,6 +88,25 @@ class ClearingMember:
             client.record_trades(day, trades[m], accepted_mask[m])
 
         self.cm_portfolio_history.append(self.aggregate_portfolio())
+
+    def margin_called(self, amount: float) -> bool:
+        if self.liquidity_status != LiquidityStatus.LIQUID:
+            return False
+        if amount <= float(self.cm_wealth):
+            self.cm_wealth = float(self.cm_wealth - amount)
+            self.cm_funds = float(self.cm_funds + amount)
+            self.cm_wealth_history.append(float(self.cm_wealth))
+            return True
+        self.liquidity_status = LiquidityStatus.DEFAULT
+        return False
+
+    def liquidate_clients(self, *, mark_default: bool = True, wipe_collateral: bool = True) -> None:
+        for client in self.clients:
+            client.liquidate_portfolio()
+            if wipe_collateral:
+                client.set_collateral(0.0)
+            if mark_default:
+                client.liquidity_status = LiquidityStatus.DEFAULT
 
     def build_qubo_for_trades(
         self,

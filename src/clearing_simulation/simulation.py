@@ -24,18 +24,57 @@ def build_clearing_members(
     n_instruments: int,
     margin_func,
     device: torch.device,
+    client_spec: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, ClearingMember]:
+    def _parse_range(value: Any, label: str) -> Optional[tuple[int, int]]:
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            low = int(value[0])
+            high = int(value[1])
+            if low > high:
+                raise ValueError(f"{label} must satisfy min <= max, got {value}.")
+            return low, high
+        raise ValueError(f"{label} must be a 2-item list or tuple, got {value}.")
+
     clearing_members: Dict[str, ClearingMember] = {}
+    client_spec = client_spec or {}
+    income_range_default = _parse_range(client_spec.get("income_range"), "clients.income_range")
+    freq_range_default = _parse_range(
+        client_spec.get("income_frequency_range"),
+        "clients.income_frequency_range",
+    )
     client_id = 0
     for cm_name, spec in cm_spec.items():
         n_clients = int(spec.get("n_clients", 0))
         cm_funds = float(spec.get("cm_funds", 0.0))
+        cm_wealth = spec.get("cm_wealth")
+        if cm_wealth is not None:
+            cm_wealth = float(cm_wealth)
+        income_range = _parse_range(
+            spec.get("client_income_range", income_range_default),
+            f"clearing_members.{cm_name}.client_income_range",
+        )
+        freq_range = _parse_range(
+            spec.get("client_income_frequency_range", freq_range_default),
+            f"clearing_members.{cm_name}.client_income_frequency_range",
+        )
         cm_clients = []
         for _ in range(n_clients):
+            income = None
+            if income_range is not None:
+                low, high = income_range
+                income = int(torch.randint(low, high + 1, (1,)).item())
+            income_frequency = None
+            if freq_range is not None:
+                low, high = freq_range
+                income_frequency = int(torch.randint(low, high + 1, (1,)).item())
             c = Client(
                 n_instruments=n_instruments,
                 margin_func=margin_func,
                 device=device,
+                income=income,
+                income_frequency=income_frequency,
                 client_id=client_id,
             )
             cm_clients.append(c)
@@ -43,6 +82,7 @@ def build_clearing_members(
         clearing_members[cm_name] = ClearingMember(
             clients=cm_clients,
             cm_funds=cm_funds,
+            cm_wealth=cm_wealth,
             name=cm_name,
             device=device,
         )
@@ -76,6 +116,41 @@ def _choose_market_index(strategy: str, day: int, T_total: int, device: torch.de
     if strategy == "sequential":
         return day % T_total
     return int(torch.randint(0, T_total, (1,), device=device).item())
+
+
+def _apply_default_waterfall(
+    *,
+    shortfall: float,
+    cm_funds_available: float,
+    cm_absorbs_shortfall: bool,
+    ccps: Dict[str, CCP],
+    ccp_default_fund_used: Dict[str, float],
+) -> tuple[float, float, float]:
+    if shortfall <= 0.0:
+        return 0.0, 0.0, 0.0
+
+    cm_available = max(0.0, float(cm_funds_available))
+    cm_used = min(cm_available, shortfall) if cm_absorbs_shortfall else 0.0
+    remaining = shortfall - cm_used
+
+    ccp_used = 0.0
+    if remaining > 0.0:
+        for ccp_name in sorted(ccps):
+            ccp = ccps[ccp_name]
+            available = max(0.0, float(ccp.default_fund))
+            if available <= 0.0:
+                continue
+            use = min(available, remaining)
+            if use <= 0.0:
+                continue
+            ccp.default_fund = available - use
+            remaining -= use
+            ccp_used += use
+            ccp_default_fund_used[ccp_name] = ccp_default_fund_used.get(ccp_name, 0.0) + use
+            if remaining <= 0.0:
+                break
+
+    return cm_used, ccp_used, remaining
 
 
 def simulate_one_day(
@@ -133,6 +208,14 @@ def simulate_one_day(
     system_total_active_trades = 0
     system_total_accepted_trades = 0
     system_total_zero_collateral_clients = 0
+    system_total_default_shortfall = 0.0
+    system_total_cm_funds_used = 0.0
+    system_total_ccp_default_used = 0.0
+    system_total_residual_shortfall = 0.0
+    system_total_collateral_seized = 0.0
+    system_total_ccp_cm_shortfall = 0.0
+    system_total_ccp_cm_residual_shortfall = 0.0
+    system_total_ccp_cm_collateral_seized = 0.0
 
     cms_metrics: Dict[str, Any] = {}
     details: Dict[str, Any] = {}
@@ -143,7 +226,74 @@ def simulate_one_day(
         if include_scenarios:
             details["scenarios"] = scenarios
 
+    ccp_default_fund_used: Dict[str, float] = {name: 0.0 for name in ccps}
+    ccp_pre_metrics: Dict[str, Any] = {}
+
     with torch.no_grad():
+        for ccp_name, ccp in ccps.items():
+            margins_cm = ccp.compute_cm_margins(scenarios, alpha=alpha)
+            funds_cm_pre = ccp.cm_funds_tensor()
+            shortfalls_cm_pre = torch.clamp(margins_cm - funds_cm_pre, min=0.0)
+            margin_ccp = ccp.compute_ccp_margin(scenarios, alpha=alpha)
+
+            ccp_pre_metrics[ccp_name] = {
+                "ccp_margin": margin_ccp,
+                "cm_margins": margins_cm,
+                "cm_funds": funds_cm_pre,
+                "cm_shortfalls": shortfalls_cm_pre,
+                "cm_margin_calls": [],
+            }
+            if include_details and include_portfolios:
+                ccp_pre_metrics[ccp_name]["net_portfolio"] = ccp.ccp_net_portfolio()
+
+        for ccp_name, ccp in ccps.items():
+            pre = ccp_pre_metrics.get(ccp_name, {})
+            shortfalls_cm_pre = pre.get("cm_shortfalls", torch.zeros(0))
+
+            cm_margin_calls = []
+            for idx_cm, cm in enumerate(ccp.clearing_members):
+                amount = float(shortfalls_cm_pre[idx_cm].item()) if shortfalls_cm_pre.numel() > 0 else 0.0
+                record = {
+                    "cm_name": cm.name,
+                    "called": False,
+                    "amount": 0.0,
+                    "accepted": None,
+                    "liquidated": False,
+                    "collateral_used": 0.0,
+                    "default_fund_used": 0.0,
+                    "residual_shortfall": 0.0,
+                }
+                if amount > 0:
+                    record["called"] = True
+                    record["amount"] = amount
+                    system_total_ccp_cm_shortfall += amount
+                    accepted = cm.margin_called(amount)
+                    record["accepted"] = bool(accepted)
+                    if not accepted:
+                        if liquidate_on_default:
+                            cm.liquidate_clients()
+                            record["liquidated"] = True
+
+                        collateral_used = max(0.0, float(cm.cm_funds))
+                        record["collateral_used"] = collateral_used
+                        system_total_ccp_cm_collateral_seized += collateral_used
+
+                        cm.cm_funds = 0.0
+                        cm.cm_wealth = 0.0
+
+                        available = max(0.0, float(ccp.default_fund))
+                        use = min(available, amount)
+                        ccp.default_fund = available - use
+                        record["default_fund_used"] = use
+                        ccp_default_fund_used[ccp_name] = ccp_default_fund_used.get(ccp_name, 0.0) + use
+                        system_total_ccp_default_used += use
+
+                        residual = amount - use
+                        record["residual_shortfall"] = residual
+                        system_total_ccp_cm_residual_shortfall += residual
+                cm_margin_calls.append(record)
+            pre["cm_margin_calls"] = cm_margin_calls
+
         for cm_name, cm in clearing_members.items():
             client_start = []
             recklessness_before = []
@@ -161,6 +311,15 @@ def simulate_one_day(
                         }
                     )
                     recklessness_before.append(float(client.recklessness))
+
+            income_applied = []
+            for client in cm.clients:
+                income_due = (
+                    client.liquidity_status == client.liquidity_status.LIQUID
+                    and day % client.income_frequency == 0
+                )
+                income_applied.append(bool(income_due))
+                client.apply_income_if_due(day)
 
             for client in cm.clients:
                 client.update_recklessness()
@@ -238,30 +397,39 @@ def simulate_one_day(
                                 })
 
             cm.execute_trades(day, trades, accepted_mask)
+            num_rejected_trades = max(0, num_active_trades - num_accepted_trades)
+            trade_acceptance_rate = (
+                num_accepted_trades / num_active_trades
+                if num_active_trades > 0
+                else 0.0
+            )
+            trade_acceptance_warning = (
+                num_active_trades > 0 and num_accepted_trades == num_active_trades
+            )
 
             portfolios_cm = cm.portfolios_tensor()
             real_pnl_clients = portfolios_cm @ real_ret
 
-            income_applied = []
             for i_client, client in enumerate(cm.clients):
                 pnl_value = float(real_pnl_clients[i_client].item())
-                client.apply_pnl(pnl_value)
-                income_due = (
-                    client.liquidity_status == client.liquidity_status.LIQUID
-                    and day % client.income_frequency == 0
-                )
-                income_applied.append(bool(income_due))
-                client.apply_income_if_due(day)
+                client.apply_variation_margin(pnl_value)
 
             client_margins = margin(portfolios_cm, scenarios, alpha=alpha)
             collaterals_cm = cm.collaterals_tensor()
             shortfall = client_margins - collaterals_cm
             needs_call = shortfall > 0
 
-            default_shortfall = 0.0
+            total_default_shortfall = 0.0
+            collateral_seized_total = 0.0
             # Market margin calls (due to portfolio risk from market moves)
             market_margin_call_records = [
-                {"called": False, "amount": 0.0, "accepted": None, "liquidated": False}
+                {
+                    "called": False,
+                    "amount": 0.0,
+                    "accepted": None,
+                    "liquidated": False,
+                    "collateral_used": 0.0,
+                }
                 for _ in range(len(cm.clients))
             ]
             for i_client, client in enumerate(cm.clients):
@@ -274,18 +442,29 @@ def simulate_one_day(
                     "amount": M,
                     "accepted": bool(accepted),
                     "liquidated": False,
+                    "collateral_used": 0.0,
                 }
                 if not accepted:
                     if liquidate_on_default:
                         client.liquidate_portfolio()
-                        client.set_collateral(0.0)
-                        record["liquidated"] = True
-                    if cm_absorbs_shortfall:
-                        default_shortfall += M
+                    record["liquidated"] = True
+                    collateral_used = max(0.0, float(client.collateral))
+                    collateral_seized_total += collateral_used
+                    record["collateral_used"] = collateral_used
+                    client.set_collateral(0.0)
+                    total_default_shortfall += M
                 market_margin_call_records[i_client] = record
 
             cm_pnl = float(real_pnl_clients.sum().item())
-            cm.cm_funds = max(0.0, cm.cm_funds + cm_pnl - default_shortfall)
+            cm_funds_available = cm.cm_funds + cm_pnl
+            cm_used, ccp_used, residual_shortfall = _apply_default_waterfall(
+                shortfall=total_default_shortfall,
+                cm_funds_available=cm_funds_available,
+                cm_absorbs_shortfall=cm_absorbs_shortfall,
+                ccps=ccps,
+                ccp_default_fund_used=ccp_default_fund_used,
+            )
+            cm.cm_funds = max(0.0, cm_funds_available - cm_used)
 
             collaterals_cm = cm.collaterals_tensor()
             total_coll = float(collaterals_cm.sum().item())
@@ -298,6 +477,8 @@ def simulate_one_day(
 
             cms_metrics[cm_name] = {
                 "cm_funds": cm.cm_funds,
+                "cm_wealth": cm.cm_wealth,
+                "cm_liquidity_status": cm.liquidity_status.name,
                 "total_client_collateral": total_coll,
                 "avg_client_collateral": avg_coll,
                 "min_client_collateral": min_coll,
@@ -305,7 +486,15 @@ def simulate_one_day(
                 "total_client_margin": total_margin,
                 "num_active_trades": num_active_trades,
                 "num_accepted_trades": num_accepted_trades,
+                "num_rejected_trades": num_rejected_trades,
+                "trade_acceptance_rate": trade_acceptance_rate,
+                "trade_acceptance_warning": trade_acceptance_warning,
                 "num_zero_collateral_clients": num_zero_coll,
+                "default_shortfall": total_default_shortfall,
+                "cm_funds_used_for_default": cm_used,
+                "ccp_default_fund_used": ccp_used,
+                "residual_shortfall": residual_shortfall,
+                "collateral_seized": collateral_seized_total,
             }
             if include_details:
                 client_details = []
@@ -346,7 +535,6 @@ def simulate_one_day(
                         entry["portfolio_end"] = client.portfolio.clone()
                     client_details.append(entry)
 
-                cms_metrics[cm_name]["default_shortfall"] = default_shortfall
                 cms_metrics[cm_name]["cm_pnl"] = cm_pnl
                 cms_metrics[cm_name]["clients"] = client_details
                 if include_portfolios:
@@ -358,18 +546,25 @@ def simulate_one_day(
             system_total_active_trades += num_active_trades
             system_total_accepted_trades += num_accepted_trades
             system_total_zero_collateral_clients += num_zero_coll
-
+            system_total_default_shortfall += total_default_shortfall
+            system_total_cm_funds_used += cm_used
+            system_total_ccp_default_used += ccp_used
+            system_total_residual_shortfall += residual_shortfall
+            system_total_collateral_seized += collateral_seized_total
         ccps_metrics: Dict[str, Any] = {}
         for ccp_name, ccp in ccps.items():
-            snapshot = ccp.snapshot_state(scenarios, alpha=alpha)
+            pre = ccp_pre_metrics.get(ccp_name, {})
             ccps_metrics[ccp_name] = {
-                "ccp_margin": snapshot["ccp_margin"],
-                "cm_margins": snapshot["cm_margins"],
-                "cm_funds": snapshot["cm_funds"],
-                "cm_shortfalls": snapshot["cm_shortfalls"],
+                "ccp_margin": pre.get("ccp_margin", 0.0),
+                "cm_margins": pre.get("cm_margins", torch.zeros(0)),
+                "cm_funds": pre.get("cm_funds", torch.zeros(0)),
+                "cm_shortfalls": pre.get("cm_shortfalls", torch.zeros(0)),
+                "default_fund_remaining": float(ccp.default_fund),
+                "default_fund_used": float(ccp_default_fund_used.get(ccp_name, 0.0)),
+                "cm_margin_calls": pre.get("cm_margin_calls", []),
             }
-            if include_details and include_portfolios:
-                ccps_metrics[ccp_name]["net_portfolio"] = snapshot["net_portfolio"]
+            if include_details and include_portfolios and "net_portfolio" in pre:
+                ccps_metrics[ccp_name]["net_portfolio"] = pre["net_portfolio"]
 
     num_clients_total = sum(len(cm.clients) for cm in clearing_members.values())
     avg_client_collateral = (
@@ -377,6 +572,16 @@ def simulate_one_day(
     )
     avg_client_margin = (
         system_total_client_margin / num_clients_total if num_clients_total > 0 else 0.0
+    )
+    system_total_rejected_trades = max(0, system_total_active_trades - system_total_accepted_trades)
+    system_trade_acceptance_rate = (
+        system_total_accepted_trades / system_total_active_trades
+        if system_total_active_trades > 0
+        else 0.0
+    )
+    system_trade_acceptance_warning = (
+        system_total_active_trades > 0
+        and system_total_accepted_trades == system_total_active_trades
     )
 
     system_metrics = {
@@ -390,7 +595,18 @@ def simulate_one_day(
         "total_client_margin": system_total_client_margin,
         "num_active_trades": system_total_active_trades,
         "num_accepted_trades": system_total_accepted_trades,
+        "num_rejected_trades": system_total_rejected_trades,
+        "trade_acceptance_rate": system_trade_acceptance_rate,
+        "trade_acceptance_warning": system_trade_acceptance_warning,
         "num_zero_collateral_clients": system_total_zero_collateral_clients,
+        "total_default_shortfall": system_total_default_shortfall,
+        "total_cm_funds_used_for_default": system_total_cm_funds_used,
+        "total_ccp_default_fund_used": system_total_ccp_default_used,
+        "total_residual_shortfall": system_total_residual_shortfall,
+        "total_collateral_seized": system_total_collateral_seized,
+        "total_ccp_cm_shortfall": system_total_ccp_cm_shortfall,
+        "total_ccp_cm_residual_shortfall": system_total_ccp_cm_residual_shortfall,
+        "total_ccp_cm_collateral_seized": system_total_ccp_cm_collateral_seized,
     }
 
     payload = {

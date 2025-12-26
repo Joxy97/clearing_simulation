@@ -15,7 +15,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "data": {
         "source": "sp500",
         "data_dir": None,
-        "train_ratio": 0.8,
+        "train_ratio": 1.0,
         "K_v": 4,
         "K_c": 4,
         "loss_percentiles": [0.0, 0.01, 0.05, 0.10, 0.25, 0.40, 0.60],
@@ -36,6 +36,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "init_scenarios": 500,
         "liquidate_on_default": True,
         "cm_absorbs_shortfall": True,
+    },
+    "clients": {
+        "income_range": [100, 10000],
+        "income_frequency_range": [7, 30],
     },
     "clearing_members": {
         "CM_A": {"n_clients": 25, "cm_funds": 1_000_000.0},
